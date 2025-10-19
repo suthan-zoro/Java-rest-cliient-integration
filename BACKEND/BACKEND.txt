@@ -1,0 +1,505 @@
+AUTH.JS
+
+
+const jwt = require('jsonwebtoken');
+const User = require('../models/User');
+
+const auth = async (req, res, next) => {
+  try {
+    const token = req.header('Authorization')?.replace('Bearer ', '');
+    
+    if (!token) {
+      return res.status(401).json({ message: 'No token, authorization denied' });
+    }
+
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key');
+    req.userId = decoded.userId;
+    
+    next();
+  } catch (error) {
+    res.status(401).json({ message: 'Token is not valid' });
+  }
+};
+
+module.exports = auth;
+
+
+ACTIVITY.JS
+
+
+const mongoose = require('mongoose');
+
+const activitySchema = new mongoose.Schema({
+  user: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    required: true
+  },
+  date: {
+    type: Date,
+    required: true
+  },
+  count: {
+    type: Number,
+    default: 0
+  }
+}, {
+  timestamps: true
+});
+
+// Compound index for efficient queries
+activitySchema.index({ user: 1, date: 1 }, { unique: true });
+
+module.exports = mongoose.model('Activity', activitySchema);
+
+
+TASK.JS
+
+
+
+const express = require('express');
+const auth = require('../middleware/auth');
+const Task = require('../models/Task');
+const Activity = require('../models/Activity');
+
+const router = express.Router();
+
+// Get all tasks for user
+router.get('/', auth, async (req, res) => {
+  try {
+    const tasks = await Task.find({ user: req.userId }).sort({ createdAt: -1 });
+    res.json(tasks);
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+// Create task
+router.post('/', auth, async (req, res) => {
+  try {
+    const { title, description, priority, dueDate } = req.body;
+    
+    const task = new Task({
+      title,
+      description,
+      priority,
+      dueDate,
+      user: req.userId
+    });
+
+    await task.save();
+
+    // Update activity
+    await updateActivity(req.userId);
+
+    res.status(201).json(task);
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+// Update task
+router.put('/:id', auth, async (req, res) => {
+  try {
+    const task = await Task.findOne({ _id: req.params.id, user: req.userId });
+    
+    if (!task) {
+      return res.status(404).json({ message: 'Task not found' });
+    }
+
+    Object.assign(task, req.body);
+    await task.save();
+
+    res.json(task);
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+// Delete task
+router.delete('/:id', auth, async (req, res) => {
+  try {
+    const task = await Task.findOneAndDelete({ _id: req.params.id, user: req.userId });
+    
+    if (!task) {
+      return res.status(404).json({ message: 'Task not found' });
+    }
+
+    res.json({ message: 'Task deleted successfully' });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+// Update activity helper
+async function updateActivity(userId) {
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  await Activity.findOneAndUpdate(
+    { user: userId, date: today },
+    { $inc: { count: 1 } },
+    { upsert: true, new: true }
+  );
+}
+
+module.exports = router;
+
+
+
+USER.JS
+
+
+const mongoose = require('mongoose');
+const bcrypt = require('bcryptjs');
+
+const userSchema = new mongoose.Schema({
+  name: {
+    type: String,
+    required: true,
+    trim: true
+  },
+  email: {
+    type: String,
+    required: true,
+    unique: true,
+    lowercase: true
+  },
+  password: {
+    type: String,
+    required: true,
+    minlength: 6
+  },
+  avatarPath: {
+    type: String,
+    default: null
+  },
+  settings: {
+    notifications: {
+      email: { type: Boolean, default: true },
+      reminders: { type: Boolean, default: true },
+      weeklySummary: { type: Boolean, default: false },
+      push: { type: Boolean, default: true }
+    },
+    theme: { type: String, default: 'light' },
+    language: { type: String, default: 'english' }
+  }
+}, {
+  timestamps: true
+});
+
+// Hash password before saving
+userSchema.pre('save', async function(next) {
+  if (!this.isModified('password')) return next();
+  this.password = await bcrypt.hash(this.password, 12);
+  next();
+});
+
+// Compare password method
+userSchema.methods.comparePassword = async function(candidatePassword) {
+  return await bcrypt.compare(candidatePassword, this.password);
+};
+
+module.exports = mongoose.model('User', userSchema);
+
+
+
+ANALYSTICS.JS
+
+
+const express = require('express');
+const auth = require('../middleware/auth');
+const Task = require('../models/Task');
+const Activity = require('../models/Activity');
+
+const router = express.Router();
+
+// Get activity data for heatmap
+router.get('/activity', auth, async (req, res) => {
+  try {
+    const oneYearAgo = new Date();
+    oneYearAgo.setFullYear(oneYearAgo.getFullYear() - 1);
+
+    const activities = await Activity.find({
+      user: req.userId,
+      date: { $gte: oneYearAgo }
+    });
+
+    const activityData = {};
+    activities.forEach(activity => {
+      const dateStr = activity.date.toISOString().split('T')[0];
+      activityData[dateStr] = activity.count;
+    });
+
+    res.json(activityData);
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+// Get dashboard stats
+router.get('/stats', auth, async (req, res) => {
+  try {
+    const totalTasks = await Task.countDocuments({ user: req.userId });
+    const completedTasks = await Task.countDocuments({ 
+      user: req.userId, 
+      completed: true 
+    });
+    const pendingTasks = totalTasks - completedTasks;
+
+    res.json({
+      totalTasks,
+      completedTasks,
+      pendingTasks,
+      projects: 12 // This could be dynamic if you add project model
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+module.exports = router;
+
+
+
+AUTH.JS
+
+
+const express = require('express');
+const jwt = require('jsonwebtoken');
+const { body, validationResult } = require('express-validator');
+const User = require('../models/User');
+
+const router = express.Router();
+
+// Generate JWT token
+const generateToken = (userId) => {
+  return jwt.sign({ userId }, process.env.JWT_SECRET || 'your-secret-key', {
+    expiresIn: '7d'
+  });
+};
+
+// Register
+router.post('/register', [
+  body('name').notEmpty().withMessage('Name is required'),
+  body('email').isEmail().withMessage('Valid email is required'),
+  body('password').isLength({ min: 6 }).withMessage('Password must be at least 6 characters')
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
+    const { name, email, password } = req.body;
+
+    // Check if user exists
+    const existingUser = await User.findOne({ email });
+    if (existingUser) {
+      return res.status(400).json({ message: 'Email already exists' });
+    }
+
+    // Create user
+    const user = new User({ name, email, password });
+    await user.save();
+
+    // Generate token
+    const token = generateToken(user._id);
+
+    res.status(201).json({
+      message: 'User created successfully',
+      token,
+      user: {
+        id: user._id,
+        name: user.name,
+        email: user.email,
+        avatarPath: user.avatarPath
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+// Login
+router.post('/login', [
+  body('email').isEmail().withMessage('Valid email is required'),
+  body('password').notEmpty().withMessage('Password is required')
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
+    const { email, password } = req.body;
+
+    // Find user
+    const user = await User.findOne({ email });
+    if (!user) {
+      return res.status(400).json({ message: 'Invalid credentials' });
+    }
+
+    // Check password
+    const isMatch = await user.comparePassword(password);
+    if (!isMatch) {
+      return res.status(400).json({ message: 'Invalid credentials' });
+    }
+
+    // Generate token
+    const token = generateToken(user._id);
+
+    res.json({
+      message: 'Login successful',
+      token,
+      user: {
+        id: user._id,
+        name: user.name,
+        email: user.email,
+        avatarPath: user.avatarPath
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+module.exports = router;
+
+
+
+TASKS.JS
+
+
+
+const express = require('express');
+const router = express.Router();
+
+router.get('/', (req, res) => {
+  res.send('Tasks route working');
+});
+
+module.exports = router;
+
+
+
+
+USERS.JS
+
+
+const express = require('express');
+const auth = require('../middleware/auth');
+const Task = require('../models/Task');
+const Activity = require('../models/Activity');
+
+const router = express.Router();
+
+// Index route - helpful message for GET /api/users
+router.get('/', (req, res) => {
+  res.json({ message: 'Users API is running. Use /activity or /stats (these require auth).' });
+});
+
+// Get activity data for heatmap
+router.get('/activity', auth, async (req, res) => {
+  try {
+    const oneYearAgo = new Date();
+    oneYearAgo.setFullYear(oneYearAgo.getFullYear() - 1);
+
+    const activities = await Activity.find({
+      user: req.userId,
+      date: { $gte: oneYearAgo }
+    });
+
+    const activityData = {};
+    activities.forEach(activity => {
+      const dateStr = activity.date.toISOString().split('T')[0];
+      activityData[dateStr] = activity.count;
+    });
+
+    res.json(activityData);
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+// Get dashboard stats
+router.get('/stats', auth, async (req, res) => {
+  try {
+    const totalTasks = await Task.countDocuments({ user: req.userId });
+    const completedTasks = await Task.countDocuments({ 
+      user: req.userId, 
+      completed: true 
+    });
+    const pendingTasks = totalTasks - completedTasks;
+
+    res.json({
+      totalTasks,
+      completedTasks,
+      pendingTasks,
+      projects: 12 // This could be dynamic if you add project model
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+module.exports = router;
+
+
+SERVER.JS
+
+
+
+const express = require('express');
+const mongoose = require('mongoose');
+const cors = require('cors');
+require('dotenv').config();
+
+const app = express();
+
+// Middleware
+app.use(cors());
+app.use(express.json());
+
+// Routes
+app.use('/api/auth', require('./routes/auth'));
+app.use('/api/users', require('./routes/users'));
+app.use('/api/tasks', require('./routes/tasks'));
+app.use('/api/analytics', require('./routes/analytics'));
+
+// MongoDB connection
+mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/nmproject', {
+  useNewUrlParser: true,
+  useUnifiedTopology: true,
+});
+
+const db = mongoose.connection;
+db.on('error', console.error.bind(console, 'connection error:'));
+db.once('open', () => {
+  console.log('Connected to MongoDB');
+});
+
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
+
+// Simple health endpoint for quick connectivity checks
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'ok', time: new Date().toISOString() });
+});
+
+
+
+
+TEST.JS
+
+
+
+require('dotenv').config();
+const process=require("process")
+console.log(process.env.MONGODB_URI)
+
+
+
+
